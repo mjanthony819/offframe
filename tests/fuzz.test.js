@@ -6,7 +6,7 @@ import { fx, inflate } from './helpers.js';
 // Small seeded PRNG so failures are reproducible.
 function rng(seed) { let s = seed >>> 0; return () => { s = (Math.imul(s, 1664525) + 1013904223) >>> 0; return s / 4294967296; }; }
 
-for (const name of ['trail-photo.jpg', 'screen-capture.png', 'trailer.jpg']) {
+for (const name of ['trail-photo.jpg', 'screen-capture.png', 'trailer.jpg', 'trail-photo.webp']) {
   test(`fuzz ${name}: 1500 mutations never crash or hang; accepted outputs re-parse`, async () => {
     const base = fx(name);
     const rand = rng(12345 + name.length);
