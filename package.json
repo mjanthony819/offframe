@@ -1,0 +1,13 @@
+{
+  "name": "offframe",
+  "version": "1.0.0",
+  "description": "Browser-local JPEG and PNG metadata audit and removal. No upload, no backend.",
+  "type": "module",
+  "license": "MIT",
+  "scripts": {
+    "test": "node --test tests/engine.test.js tests/fuzz.test.js",
+    "test:external": "node --test tests/external.test.js",
+    "test:ui": "python3 tests/ui_test.py",
+    "fixtures": "python3 make_fixtures.py"
+  }
+}
