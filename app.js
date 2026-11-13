@@ -3,7 +3,8 @@ import { makeZip } from './zip.js';
 
 const $ = (id) => document.getElementById(id);
 const MAX_FILES = 20;
-const SAMPLES = ['trail-photo.jpg', 'screen-capture.png', 'trailer.jpg', 'already-clean.jpg', 'hostile-comment.jpg'];
+const MIME = { jpeg: 'image/jpeg', png: 'image/png', webp: 'image/webp' };
+const SAMPLES = ['trail-photo.jpg', 'screen-capture.png', 'trailer.jpg', 'already-clean.jpg', 'hostile-comment.jpg', 'trail-photo.webp', 'alpha-sticker.webp', 'animated-clean.webp'];
 const state = { items: [], selected: -1, urls: [] };
 
 $('ver').textContent = VERSION;
@@ -75,10 +76,12 @@ async function addFiles(fileList) {
       item.origBytes = bytes;
       item.result = await strip(bytes, options());
       item.analysis = item.result.before;
-      item.origUrl = URL.createObjectURL(new Blob([bytes], { type: item.analysis.format === 'jpeg' ? 'image/jpeg' : 'image/png' }));
-      const cleanBlob = new Blob([item.result.bytes], { type: item.analysis.format === 'jpeg' ? 'image/jpeg' : 'image/png' });
+      item.origUrl = URL.createObjectURL(new Blob([bytes], { type: MIME[item.analysis.format] }));
+      const cleanBlob = new Blob([item.result.bytes], { type: MIME[item.analysis.format] });
       item.cleanUrl = URL.createObjectURL(cleanBlob);
-      const droppedFlag = !$('keepOri').checked && item.analysis.orientation > 1;
+      // Browsers honour the rotation flag in JPEG and PNG but ignore it in WebP (verified in Chrome 158),
+      // so only JPEG/PNG get the rotation warning and skip the visual-equality check when it is dropped.
+      const droppedFlag = !$('keepOri').checked && item.analysis.orientation > 1 && item.analysis.format !== 'webp';
       item.droppedRotation = droppedFlag;
       item.result.checks.decodedPixelsIdentical = await pixelsMatch(new Blob([bytes]), cleanBlob, item.analysis.width, item.analysis.height, droppedFlag);
       item.opts = { keepOrientation: $('keepOri').checked, keepColorProfile: $('keepIcc').checked };
@@ -142,7 +145,7 @@ function select(i) {
 
 function errorCard(it) {
   const c = el('div', 'card err');
-  c.append(el('h2', null, it.name), el('p', null, it.error), el('p', 'muted', 'Nothing was changed and nothing leaves your device. Only JPEG and PNG files are supported, and damaged files are refused rather than repaired.'));
+  c.append(el('h2', null, it.name), el('p', null, it.error), el('p', 'muted', 'Nothing was changed and nothing leaves your device. Only JPEG, PNG and WebP files are supported, and damaged files are refused rather than repaired.'));
   return c;
 }
 
@@ -152,10 +155,72 @@ function header(it) {
   const t = el('div'); t.append(el('h2', 'fname', it.name), el('p', 'muted', `${a.details} - ${a.width} x ${a.height} px - ${fmtBytes(it.size)}`));
   const act = el('div', 'acts');
   const dl = el('button', 'primary', 'Download clean file'); dl.type = 'button';
-  dl.addEventListener('click', () => download(defaultFileName(it.name, a.format), it.result.bytes, a.format === 'jpeg' ? 'image/jpeg' : 'image/png'));
+  dl.addEventListener('click', () => download(defaultFileName(it.name, a.format), it.result.bytes, MIME[a.format]));
   const rc = el('button', 'soft', 'Receipt (JSON)'); rc.type = 'button';
   rc.addEventListener('click', () => download(`${it.name}.receipt.json`, new TextEncoder().encode(JSON.stringify(buildReceipt(it.name, it.result, it.opts), null, 2)), 'application/json'));
-  act.append(dl, rc); h.append(t, act); return h;
+  const sc = el('button', 'soft', 'Summary card (PNG)'); sc.type = 'button';
+  sc.title = 'A human-readable picture of what was removed, made to send along with the clean photo.';
+  sc.addEventListener('click', () => {
+    try {
+      summaryCardCanvas(it).toBlob((b) => { if (b) download(`${it.name.replace(/\.[A-Za-z0-9]+$/, '')}.offframe-summary.png`, b, 'image/png'); }, 'image/png');
+    } catch (e) { say('The summary card could not be drawn in this browser.'); }
+  });
+  act.append(dl, rc, sc); h.append(t, act); return h;
+}
+
+// A shareable, human-readable summary of one cleaned file, drawn locally on a canvas.
+function summaryCardCanvas(it) {
+  const W = 1080, H = 1350, pad = 72;
+  const c = document.createElement('canvas'); c.width = W; c.height = H;
+  const x = c.getContext('2d');
+  const ink = '#14213d', accent = '#d9481f', muted = '#5a5548', paper = '#f7f4ee';
+  x.fillStyle = paper; x.fillRect(0, 0, W, H);
+  x.strokeStyle = ink; x.lineWidth = 6; x.strokeRect(28, 28, W - 56, H - 56);
+  const wrap = (text, yy, font, color, lh) => {
+    x.font = font; x.fillStyle = color;
+    for (const line of text.split('\n')) {
+      let words = line.split(' '), cur = '';
+      for (const w of words) {
+        const t = cur ? cur + ' ' + w : w;
+        if (x.measureText(t).width > W - 2 * pad && cur) { x.fillText(cur, pad, yy); yy += lh; cur = w; } else cur = t;
+      }
+      if (cur) { x.fillText(cur, pad, yy); yy += lh; }
+    }
+    return yy;
+  };
+  let y = pad + 44;
+  y = wrap('Offframe removal summary', y, '700 54px Georgia, serif', ink, 60) + 6;
+  y = wrap(new Date().toLocaleString(undefined, { dateStyle: 'long', timeStyle: 'short' }), y, '400 26px system-ui, sans-serif', muted, 32) + 26;
+  y = wrap(it.name, y, '600 36px system-ui, sans-serif', ink, 44);
+  y = wrap(`${it.analysis.details} - ${it.analysis.width} x ${it.analysis.height} px`, y, '400 26px system-ui, sans-serif', muted, 32) + 26;
+  const groups = new Map();
+  for (const f of it.result.before.findings) {
+    if (f.severity === 'info') continue;
+    const k = CAT[f.category] || f.category;
+    if (!groups.has(k)) groups.set(k, new Set());
+    groups.get(k).add(f.label);
+  }
+  y = wrap('Removed', y, '700 34px system-ui, sans-serif', accent, 40) + 4;
+  if (!groups.size) y = wrap('Nothing personal was stored in the file data.', y, '400 28px system-ui, sans-serif', ink, 36) + 6;
+  else for (const [cat, labels] of groups) {
+    y = wrap(`${cat}: ${[...labels].slice(0, 6).join('; ')}`, y, '400 28px system-ui, sans-serif', ink, 38) + 8;
+  }
+  y += 8;
+  if (it.result.kept.length) y = wrap(`Kept on purpose: ${it.result.kept.join('; ')}`, y, '400 26px system-ui, sans-serif', muted, 34) + 18;
+  y = wrap('Checked', y, '700 34px system-ui, sans-serif', accent, 40) + 4;
+  const ch = it.result.checks;
+  const lines = [
+    ch.imageDataIdentical ? 'Image data is byte-identical before and after (SHA-256 match).' : 'Image data changed - do not use this output.',
+    ch.dimensionsIdentical ? 'Dimensions unchanged.' : 'Dimensions changed - do not use this output.',
+    ch.noMetadataFindingsLeft ? 'The cleaned file was re-scanned: none of the targeted identifying metadata is left (kept fields are listed above).' : 'Re-scan still finds metadata - do not use this output.',
+    ch.decodedPixelsIdentical === true ? 'The browser decoded both files: pixels match.' : ch.decodedPixelsIdentical === false ? 'Decoded pixels differ - do not use this output.' : 'Pixel decode check not run for this file.',
+  ];
+  for (const l of lines) y = wrap('- ' + l, y, '400 28px system-ui, sans-serif', ink, 38) + 2;
+  y += 16;
+  x.strokeStyle = muted; x.lineWidth = 2; x.beginPath(); x.moveTo(pad, y); x.lineTo(W - pad, y); x.stroke(); y += 42;
+  y = wrap('Pixels were not changed: faces, signs, screens and other visible content stay in the picture. This card lists labels only, never the removed values.', y, '400 25px system-ui, sans-serif', muted, 33) + 10;
+  wrap('Made by Offframe v' + VERSION + ' - runs fully in the browser, nothing is uploaded.', y, '400 25px system-ui, sans-serif', muted, 33);
+  return c;
 }
 
 function verdict(it) {
@@ -270,6 +335,15 @@ drop.addEventListener('drop', (e) => addFiles(e.dataTransfer.files));
 window.addEventListener('dragover', (e) => e.preventDefault());
 window.addEventListener('drop', (e) => { e.preventDefault(); });
 $('samples').addEventListener('click', () => loadSamples().catch(() => say('Samples could not be loaded.')));
+$('folderBtn').addEventListener('click', () => $('folderFile').click());
+$('folderFile').addEventListener('change', async () => {
+  const all = [...$('folderFile').files];
+  $('folderFile').value = '';
+  const ok = all.filter((f) => /\.(jpe?g|png|webp)$/i.test(f.name));
+  const skipped = all.length - ok.length;
+  await addFiles(ok);
+  if (skipped) say(`${state.items.filter((i) => i.status === 'done').length} file(s) ready. ${skipped} unsupported file(s) in that folder were skipped - only JPEG, PNG and WebP are read.`);
+});
 $('zipAll').addEventListener('click', () => {
   const used = new Set(); const files = [];
   for (const it of state.items.filter((i) => i.status === 'done')) {
