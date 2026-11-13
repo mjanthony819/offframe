@@ -245,3 +245,98 @@ test('JPEG colour profile is kept by default and only removed when asked', async
   assert.ok(!gone.after.iccPresent);
   assert.ok(gone.removed.includes('Colour profile (ICC)'));
 });
+
+// ---------- WebP ----------
+import { walkWebp } from '../engine.js';
+
+test('sniff recognises WebP by RIFF/WEBP signature', () => {
+  assert.equal(sniff(fx('trail-photo.webp')), 'webp');
+  assert.equal(sniff(new TextEncoder().encode('RIFF\x04\x00\x00\x00WAVE')), null);
+});
+
+test('WebP fixture: finds location, device, orientation and XMP', async () => {
+  const a = await analyze(fx('trail-photo.webp'));
+  assert.equal(a.format, 'webp');
+  assert.equal(a.width, 640);
+  assert.equal(a.height, 480);
+  assert.ok(a.gps && Math.abs(a.gps.lat - 48.85837) < 1e-4);
+  assert.equal(a.orientation, 6);
+  for (const s of ['GPS coordinates', 'Camera make', 'Camera model', 'XMP metadata block']) {
+    assert.ok(has(a, s), `missing finding: ${s}; got ${labels(a).join(' | ')}`);
+  }
+});
+
+test('strip WebP: metadata gone, image bytes identical, VP8X flags cleared', async () => {
+  const r = await strip(fx('trail-photo.webp'), { inflate });
+  assert.ok(r.checks.imageDataIdentical);
+  assert.ok(r.checks.dimensionsIdentical);
+  assert.ok(r.checks.noMetadataFindingsLeft, `leftovers: ${r.checks.leftovers}`);
+  const w = walkWebp(r.bytes);
+  const types = w.chunks.map((c) => c.type);
+  assert.ok(!types.includes('XMP '));
+  const x = w.chunks.find((c) => c.type === 'VP8X');
+  if (x) {
+    assert.equal(r.bytes[x.dataStart] & 0x04, 0, 'XMP flag bit must be cleared');
+    assert.ok(r.bytes[x.dataStart] & 0x08, 'EXIF flag stays set only because the orientation tag is rewritten');
+  }
+  // orientation kept as a minimal rewritten EXIF block
+  const exif = w.chunks.find((c) => c.type === 'EXIF');
+  assert.ok(exif, 'orientation EXIF should be rewritten');
+  const t = parseTiff(r.bytes, exif.dataStart, exif.size, 'EXIF');
+  assert.equal(t.orientation, 6);
+  assert.ok(!t.gps);
+  assert.ok(exif.size < 40, 'rewritten EXIF holds only the orientation tag');
+});
+
+test('strip WebP with orientation off: no EXIF chunk at all', async () => {
+  const r = await strip(fx('trail-photo.webp'), { inflate, keepOrientation: false });
+  const types = walkWebp(r.bytes).chunks.map((c) => c.type);
+  assert.ok(!types.includes('EXIF'));
+  assert.ok(r.checks.imageDataIdentical);
+});
+
+test('lossless WebP with transparency: VP8L bytes identical after strip', async () => {
+  const r = await strip(fx('alpha-sticker.webp'), { inflate });
+  assert.ok(r.checks.imageDataIdentical);
+  assert.ok(!r.after.gps);
+  assert.ok(r.after.details.includes('lossless'));
+});
+
+test('animated WebP: animation chunks survive stripping', async () => {
+  const r = await strip(fx('animated-clean.webp'), { inflate });
+  const types = walkWebp(r.bytes).chunks.map((c) => c.type);
+  assert.ok(types.includes('ANIM') && types.includes('ANMF'));
+  assert.ok(r.checks.imageDataIdentical);
+});
+
+test('already-clean WebP: nothing to remove, output stable', async () => {
+  const r = await strip(fx('already-clean.webp'), { inflate });
+  assert.ok(r.checks.imageDataIdentical);
+  assert.equal(r.before.findings.filter((f) => f.severity === 'high').length, 0);
+});
+
+test('WebP with bytes after the RIFF payload: flagged and removed', async () => {
+  const base = fx('already-clean.webp');
+  const extra = new Uint8Array([...base, 1, 2, 3, 4, 5, 6, 7, 8]);
+  const a = await analyze(extra);
+  assert.ok(has(a, 'Extra bytes after the end of the image'));
+  const r = await strip(extra, { inflate });
+  assert.equal(r.bytes.length, base.length);
+  assert.ok(r.checks.imageDataIdentical);
+});
+
+test('damaged WebP is refused, not guessed at', async () => {
+  const base = fx('trail-photo.webp');
+  await assert.rejects(strip(base.subarray(0, base.length - 100), { inflate }), OffframeError);
+  const bad = base.slice(); bad[12] = 0x01; // corrupt the first chunk's name
+  await assert.rejects(strip(bad, { inflate }), OffframeError);
+});
+
+test('receipt works for WebP and never copies metadata values', async () => {
+  const r = await strip(fx('trail-photo.webp'), { inflate });
+  const receipt = JSON.parse(new TextDecoder().decode(new TextEncoder().encode(JSON.stringify(buildReceipt('trail-photo.webp', r, { keepOrientation: true, keepColorProfile: true })))));
+  assert.equal(receipt.input.format, 'webp');
+  assert.ok(receipt.checks.imageDataIdentical);
+  const flat = JSON.stringify(receipt);
+  assert.ok(!flat.includes('48.858'), 'receipt must not contain coordinates');
+});
