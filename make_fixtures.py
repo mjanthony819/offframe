@@ -86,3 +86,18 @@ icc=ImageCms.ImageCmsProfile(ImageCms.createProfile('sRGB')).tobytes()
 scene(320,220,'icc-profile.jpg',7).save(f'{F}/icc-profile.jpg',quality=88,icc_profile=icc)
 subprocess.run(['exiftool','-overwrite_original','-q','-q','-Make=SynthCam','-GPSLatitude=40.689','-GPSLatitudeRef=N','-GPSLongitude=74.0445','-GPSLongitudeRef=W',f'{F}/icc-profile.jpg'],check=True)
 print('display fixtures ok')
+
+# --- WebP fixtures (v1.1.0) ---
+# Note: ExifTool (12.40) cannot WRITE WebP metadata; Pillow 12.x can (exif=/xmp= on save).
+src = Image.open(f'{F}/trail-photo.jpg')
+exif = src.info.get('exif', b'')
+xmp = src.info.get('xmp', b'')
+scene(640, 480, 'trail-photo.webp', seed=7).save(f'{F}/trail-photo.webp', 'WEBP', quality=88, exif=exif, xmp=xmp)
+rgba = Image.new('RGBA', (320, 240), (0, 0, 0, 0))
+d = ImageDraw.Draw(rgba)
+d.ellipse([40, 30, 280, 210], fill=(217, 72, 31, 255))
+d.text((60, 100), 'alpha webp (synthetic)', fill=(20, 33, 61, 255))
+rgba.save(f'{F}/alpha-sticker.webp', 'WEBP', lossless=True, exif=exif)
+f1 = scene(240, 180, 'frame 1', seed=11); f2 = scene(240, 180, 'frame 2', seed=12)
+f1.save(f'{F}/animated-clean.webp', 'WEBP', save_all=True, append_images=[f2], duration=400, loop=0)
+scene(400, 300, 'already-clean.webp', seed=13).save(f'{F}/already-clean.webp', 'WEBP', quality=85)
