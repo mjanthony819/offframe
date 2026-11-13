@@ -950,4 +950,4 @@ export function buildReceipt(fileName, result, options) {
       'This receipt lists labels and sizes only, never the removed values.',
     ],
   };
-                            }
+}
