@@ -50,8 +50,8 @@ No build step. Open `index.html` through any static server (ES modules need http
 ## Tests
 
 ```
-npm test                 # 24 engine and fuzz tests, no dependencies
-npm run test:external    # ExifTool and Pillow as independent checkers (needs both installed)
+npm test                 # 26 engine and fuzz tests, no dependencies
+npm run test:external    # 14 ExifTool and Pillow checks (needs both installed)
 python3 tests/ui_test.py # drives the real page in Chrome (needs Playwright and Chrome)
 ```
 
