@@ -66,7 +66,7 @@ What the tests cover:
 
 ## How this was built
 
-Designed and directed by M J Anthony. Implementation, tests and the demo were produced with AI assistance (an AI agent wrote the code and ran the tests), and that is disclosed on the Devpost page. Work started on 13 November 2026, inside the SafeSpace Hacks build window. No pre-existing code was reused. Libraries: none at runtime.
+Designed and directed by M J Anthony. Implementation, tests and the demo were produced with AI assistance (an AI agent wrote the code and ran the tests), and that is disclosed on the Devpost page. Work started on 13 November 2026, inside the SafeSpace Hacks build window. The app's own source was written during the build window; no earlier project code was reused. Runtime libraries: none. Tools used for fixtures, tests and the demo: Pillow and ExifTool (fixture generation and independent checks), Playwright with Chrome (UI test), ffmpeg (video). The demo narration is AI text-to-speech.
 
 ## Related tools
 
