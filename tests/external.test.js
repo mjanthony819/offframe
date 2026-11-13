@@ -55,6 +55,45 @@ test('orientation tag survives for the rotated fixture, as ExifTool reads it', {
   const gps = execFileSync('exiftool', ['-GPS:all', out]).toString().trim();
   assert.equal(gps, '');
 });
+
+const extOf = (n) => n.endsWith('png') ? '.png' : n.endsWith('webp') ? '.webp' : '.jpg';
+const OK_WEBP_GROUPS = new Set(['ExifTool', 'System', 'File', 'RIFF', 'Composite']);
+for (const name of ['trail-photo.webp', 'alpha-sticker.webp', 'animated-clean.webp', 'already-clean.webp']) {
+  test(`ExifTool sees no metadata left in stripped ${name}`, { skip: !hasExif && 'exiftool not installed' }, async () => {
+    const r = await strip(fx(name), { inflate });
+    const dir = mkdtempSync(join(tmpdir(), 'offframe-'));
+    const out = join(dir, 'out' + extOf(name));
+    writeFileSync(out, r.bytes);
+    const txt = execFileSync('exiftool', ['-a', '-G1', '-s', '-api', 'largefilesupport=1', out]).toString();
+    const warn = execFileSync('exiftool', ['-validate', '-warning', '-error', '-s3', out]).toString().trim();
+    const rows = txt.split('\n').filter(Boolean).map((l) => { const m = l.match(/^\[(.+?)\]\s+(\S+)\s*:\s*(.*)$/); return m && { g: m[1], k: m[2], v: m[3] }; }).filter(Boolean);
+    const extra = rows.filter((x) => !OK_WEBP_GROUPS.has(x.g) && !(x.g === 'IFD0' && (x.k === 'Orientation' || /Resolution|YCbCr/.test(x.k))));
+    assert.deepEqual(extra, [], `leftover tags: ${JSON.stringify(extra)}`);
+    assert.ok(!/error/i.test(warn), `exiftool validate: ${warn}`);
+  });
+
+  test(`Pillow decodes identical pixels before and after ${name}`, { skip: !hasPil && 'Pillow not installed' }, async () => {
+    const r = await strip(fx(name), { inflate });
+    const dir = mkdtempSync(join(tmpdir(), 'offframe-'));
+    const a = join(dir, 'a' + extOf(name));
+    const b = join(dir, 'b' + extOf(name));
+    writeFileSync(a, fx(name));
+    writeFileSync(b, r.bytes);
+    const py = `import sys,hashlib\nfrom PIL import Image\nA=Image.open(sys.argv[1]);B=Image.open(sys.argv[2])\nA.load();B.load()\nassert A.size==B.size,(A.size,B.size)\nassert A.mode==B.mode,(A.mode,B.mode)\nassert hashlib.sha256(A.tobytes()).digest()==hashlib.sha256(B.tobytes()).digest(),'pixels differ'\nprint('same',A.size,A.mode)`;
+    const out = execFileSync('python3', ['-c', py, a, b]).toString();
+    assert.match(out, /^same/);
+  });
+}
+
+test('orientation tag survives for the WebP fixture, as ExifTool reads it', { skip: !hasExif && 'exiftool not installed' }, async () => {
+  const r = await strip(fx('trail-photo.webp'), { inflate });
+  const dir = mkdtempSync(join(tmpdir(), 'offframe-'));
+  const out = join(dir, 'o.webp');
+  writeFileSync(out, r.bytes);
+  assert.equal(execFileSync('exiftool', ['-Orientation', '-n', '-s3', out]).toString().trim(), '6');
+  assert.equal(execFileSync('exiftool', ['-GPS:all', '-XMP:all', out]).toString().trim(), '');
+});
+
 void root;
 
 test('colour profile is really gone when the user unticks keep-colour-profile', { skip: !hasExif && 'exiftool not installed' }, async () => {
