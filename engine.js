@@ -1,8 +1,9 @@
-// Offframe engine: parse, report and strip metadata from JPEG and PNG bytes.
+// Offframe engine: parse, report and strip metadata from JPEG, PNG and WebP bytes.
 // Pure functions over Uint8Array. No DOM, no network. Runs in browsers and Node.
-// Scope: JPEG (baseline, extended, progressive) and PNG (including APNG). Nothing else.
+// Scope: JPEG (baseline, extended, progressive), PNG (including APNG) and WebP
+// (lossy, lossless and animated). Nothing else.
 
-export const VERSION = '1.0.0';
+export const VERSION = '1.1.0';
 export const LIMITS = Object.freeze({
   maxFileBytes: 50 * 1024 * 1024,
   maxIfdEntries: 512,
@@ -35,6 +36,7 @@ const startsWith = (b, off, str) => {
 export function sniff(bytes) {
   if (bytes.length >= 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) return 'jpeg';
   if (bytes.length >= 8 && bytes[0] === 0x89 && startsWith(bytes, 1, 'PNG') && bytes[4] === 0x0d && bytes[5] === 0x0a && bytes[6] === 0x1a && bytes[7] === 0x0a) return 'png';
+  if (bytes.length >= 12 && startsWith(bytes, 0, 'RIFF') && startsWith(bytes, 8, 'WEBP')) return 'webp';
   return null;
 }
 
@@ -709,6 +711,161 @@ function pngImageData(b, a) {
   return concat(parts);
 }
 
+// ---------- WebP ----------
+const u32leAt = (b, o) => (b[o] | (b[o + 1] << 8) | (b[o + 2] << 16) | (b[o + 3] << 24)) >>> 0;
+
+// Walk the RIFF container. Strict about structure: anything malformed is refused, not guessed at.
+export function walkWebp(b) {
+  if (sniff(b) !== 'webp') throw new OffframeError('not-webp', 'This does not start with a WebP (RIFF) header.');
+  const declared = u32leAt(b, 4) + 8;
+  if (declared > b.length) throw new OffframeError('webp-truncated', 'The RIFF header says the file holds more data than is present; it looks cut off.');
+  const chunks = [];
+  let p = 12;
+  while (p < declared) {
+    if (p + 8 > declared) throw new OffframeError('webp-corrupt', 'A chunk header does not fit inside the RIFF payload.');
+    const type = latin1(b, p, p + 4);
+    if (!/^[\x20-\x7e]{4}$/.test(type)) throw new OffframeError('webp-corrupt', 'A chunk has an invalid name.');
+    const size = u32leAt(b, p + 4);
+    const dataStart = p + 8, dataEnd = dataStart + size;
+    if (dataEnd > declared) throw new OffframeError('webp-truncated', `Chunk ${type} runs past the end of the file.`);
+    const end = dataEnd + (size & 1); // chunks are padded to even sizes
+    chunks.push({ type, start: p, end, dataStart, dataEnd, size });
+    p = end;
+  }
+  if (!chunks.length) throw new OffframeError('webp-corrupt', 'No chunks inside the RIFF container.');
+  return { chunks, trailer: b.length - declared };
+}
+
+const WEBP_KEEP = { 'VP8 ': 'Image data (lossy WebP)', 'VP8L': 'Image data (lossless WebP)', 'VP8X': 'WebP feature flags', 'ALPH': 'Transparency data', 'ANIM': 'Animation settings', 'ANMF': 'Animation frame data' };
+
+function webpDimensions(b, chunks) {
+  const x = chunks.find((c) => c.type === 'VP8X');
+  if (x && x.size >= 10) {
+    return {
+      width: 1 + (b[x.dataStart + 4] | (b[x.dataStart + 5] << 8) | (b[x.dataStart + 6] << 16)),
+      height: 1 + (b[x.dataStart + 7] | (b[x.dataStart + 8] << 8) | (b[x.dataStart + 9] << 16)),
+    };
+  }
+  const v8 = chunks.find((c) => c.type === 'VP8 ');
+  if (v8 && v8.size >= 10 && b[v8.dataStart + 3] === 0x9d && b[v8.dataStart + 4] === 0x01 && b[v8.dataStart + 5] === 0x2a) {
+    return { width: (b[v8.dataStart + 6] | (b[v8.dataStart + 7] << 8)) & 0x3fff, height: (b[v8.dataStart + 8] | (b[v8.dataStart + 9] << 8)) & 0x3fff };
+  }
+  const vl = chunks.find((c) => c.type === 'VP8L');
+  if (vl && vl.size >= 5 && b[vl.dataStart] === 0x2f) {
+    const b1 = b[vl.dataStart + 1], b2 = b[vl.dataStart + 2], b3 = b[vl.dataStart + 3], b4 = b[vl.dataStart + 4];
+    return { width: 1 + (((b2 & 0x3f) << 8) | b1), height: 1 + (((b4 & 0x0f) << 10) | (b3 << 2) | ((b2 & 0xc0) >> 6)) };
+  }
+  throw new OffframeError('webp-corrupt', 'No readable image dimensions found.');
+}
+
+function analyzeWebp(b) {
+  const walk = walkWebp(b);
+  const dim = webpDimensions(b, walk.chunks);
+  if (!dim.width || !dim.height) throw new OffframeError('webp-corrupt', 'The WebP header reports a zero-sized image.');
+  const findings = [], issues = [], items = [];
+  let orientation = null, gps = null, iccPresent = false, hasThumbnail = false;
+  let lossless = false, animated = false, alpha = false;
+  for (const ch of walk.chunks) {
+    const size = ch.end - ch.start;
+    if (ch.type === 'EXIF') {
+      items.push({ id: 'EXIF', label: 'EXIF block', bytes: size, keep: false });
+      const t = parseTiff(b, ch.dataStart, ch.size, 'EXIF');
+      findings.push(...t.findings);
+      issues.push(...t.issues);
+      if (t.orientation) orientation = t.orientation;
+      if (t.gps) gps = t.gps;
+      if (t.hasThumbnail) hasThumbnail = true;
+    } else if (ch.type === 'XMP ') {
+      items.push({ id: 'XMP', label: 'XMP block', bytes: size, keep: false });
+      findings.push(...parseXmp(latin1(b, ch.dataStart, Math.min(ch.dataEnd, ch.dataStart + LIMITS.maxXmpScan)), 'XMP'));
+      findings.push(finding('hidden', 'medium', 'XMP metadata block', `${size} bytes`, 'XMP'));
+    } else if (ch.type === 'ICCP') {
+      items.push({ id: 'ICCP', label: 'Colour profile (ICC)', bytes: size, keep: true, optional: true });
+      iccPresent = true;
+    } else if (WEBP_KEEP[ch.type]) {
+      items.push({ id: ch.type === 'VP8 ' ? 'VP8' : ch.type, label: WEBP_KEEP[ch.type], bytes: size, keep: true });
+      if (ch.type === 'VP8L') lossless = true;
+      if (ch.type === 'ANIM' || ch.type === 'ANMF') animated = true;
+      if (ch.type === 'ALPH') alpha = true;
+    } else {
+      const shown = ch.type.replace(/[^\x20-\x7e]/g, '?');
+      items.push({ id: 'UNK:' + shown, label: `Unknown WebP chunk (${shown})`, bytes: size, keep: false });
+      findings.push(finding('hidden', 'low', `Unknown WebP chunk (${shown})`, `${size} bytes`, 'RIFF'));
+    }
+  }
+  if (walk.trailer > 0) {
+    findings.push(finding('hidden', 'high', 'Extra bytes after the end of the image', `${walk.trailer} bytes`, 'Trailer', { note: 'Viewers ignore data after the RIFF payload, so files can carry hidden content here.' }));
+    items.push({ id: 'TRAILER', label: 'Bytes after end of image', bytes: walk.trailer, keep: false });
+  }
+  const details = `${animated ? 'animated ' : ''}${lossless ? 'lossless' : 'lossy'} WebP${alpha ? ', with transparency' : ''}`;
+  return { format: 'webp', width: dim.width, height: dim.height, details, findings, issues, items, orientation, gps, hasThumbnail, iccPresent, walk };
+}
+
+function webpChunk(type, data) {
+  const out = new Uint8Array(8 + data.length + (data.length & 1));
+  for (let i = 0; i < 4; i++) out[i] = type.charCodeAt(i);
+  const dv = new DataView(out.buffer);
+  dv.setUint32(4, data.length, true);
+  out.set(data, 8);
+  return out;
+}
+
+const WEBP_FLAG_ICC = 0x20, WEBP_FLAG_EXIF = 0x08, WEBP_FLAG_XMP = 0x04;
+
+function stripWebp(b, a, opts) {
+  const kept = [], removed = [];
+  const keepOrientation = opts.keepOrientation && a.orientation && a.orientation > 1;
+  const willWriteOrientation = !!keepOrientation; // the source EXIF chunk exists whenever orientation was read
+  let orientationWritten = false;
+  const body = [];
+  for (const ch of a.walk.chunks) {
+    if (ch.type === 'EXIF') {
+      removed.push('EXIF block');
+      if (keepOrientation && !orientationWritten) {
+        body.push(webpChunk('EXIF', buildOrientationTiff(a.orientation)));
+        orientationWritten = true;
+        kept.push('Orientation tag only (rewritten EXIF)');
+      }
+      continue;
+    }
+    if (ch.type === 'XMP ') { removed.push('XMP block'); continue; }
+    if (ch.type === 'ICCP') {
+      if (opts.keepColorProfile) { body.push(b.subarray(ch.start, ch.end)); kept.push('Colour profile (ICC)'); }
+      else removed.push('Colour profile (ICC)');
+      continue;
+    }
+    if (ch.type === 'VP8X') {
+      if (ch.size !== 10) throw new OffframeError('webp-corrupt', 'VP8X chunk has the wrong size.');
+      const d = b.slice(ch.dataStart, ch.dataEnd);
+      let flags = d[0];
+      flags &= ~WEBP_FLAG_XMP;
+      if (!willWriteOrientation) flags &= ~WEBP_FLAG_EXIF;
+      if (!(opts.keepColorProfile && a.iccPresent)) flags &= ~WEBP_FLAG_ICC;
+      d[0] = flags;
+      body.push(webpChunk('VP8X', d));
+      kept.push('WebP feature flags (updated)');
+      continue;
+    }
+    if (WEBP_KEEP[ch.type]) { body.push(b.subarray(ch.start, ch.end)); kept.push(WEBP_KEEP[ch.type]); continue; }
+    removed.push(`Unknown WebP chunk (${ch.type.replace(/[^\x20-\x7e]/g, '?')})`);
+  }
+  if (a.walk.trailer > 0) removed.push('Bytes after end of image');
+  const payload = concat(body);
+  const head = new Uint8Array(12);
+  head.set([0x52, 0x49, 0x46, 0x46]); // RIFF
+  new DataView(head.buffer).setUint32(4, payload.length + 4, true);
+  head.set([0x57, 0x45, 0x42, 0x50], 8); // WEBP
+  return { bytes: concat([head, payload]), kept, removed };
+}
+
+function webpImageData(b, a) {
+  const parts = [];
+  for (const ch of a.walk.chunks) {
+    if (ch.type === 'VP8 ' || ch.type === 'VP8L' || ch.type === 'ALPH' || ch.type === 'ANIM' || ch.type === 'ANMF') parts.push(b.subarray(ch.start, ch.end));
+  }
+  return concat(parts);
+}
+
 // ---------- public API ----------
 const SEVERITY_ORDER = { high: 0, medium: 1, low: 2, info: 3 };
 
@@ -717,8 +874,8 @@ export async function analyze(bytes, opts = {}) {
   if (!(bytes instanceof Uint8Array)) throw new TypeError('analyze expects a Uint8Array');
   if (bytes.length > LIMITS.maxFileBytes) throw new OffframeError('too-large', `Files over ${LIMITS.maxFileBytes / 1048576} MB are not accepted.`);
   const kind = sniff(bytes);
-  if (!kind) throw new OffframeError('unsupported', 'Only JPEG and PNG files are supported. This file is something else.');
-  const a = kind === 'jpeg' ? analyzeJpeg(bytes) : await analyzePng(bytes, opts);
+  if (!kind) throw new OffframeError('unsupported', 'Only JPEG, PNG and WebP files are supported. This file is something else.');
+  const a = kind === 'jpeg' ? analyzeJpeg(bytes) : kind === 'png' ? await analyzePng(bytes, opts) : analyzeWebp(bytes);
   a.findings.sort((x, y) => SEVERITY_ORDER[x.severity] - SEVERITY_ORDER[y.severity]);
   a.counts = { high: 0, medium: 0, low: 0, info: 0 };
   for (const f of a.findings) a.counts[f.severity]++;
@@ -733,10 +890,12 @@ export async function analyze(bytes, opts = {}) {
 export async function strip(bytes, opts = {}) {
   const o = { keepOrientation: true, keepColorProfile: true, inflate: opts.inflate, ...opts };
   const before = await analyze(bytes, o);
-  const r = before.format === 'jpeg' ? stripJpeg(bytes, before, o) : stripPng(bytes, before, o);
+  const strippers = { jpeg: stripJpeg, png: stripPng, webp: stripWebp };
+  const imageData = { jpeg: jpegImageHash, png: pngImageData, webp: webpImageData };
+  const r = strippers[before.format](bytes, before, o);
   const after = await analyze(r.bytes, o);
-  const dataBefore = before.format === 'jpeg' ? jpegImageHash(bytes, before) : pngImageData(bytes, before);
-  const dataAfter = after.format === 'jpeg' ? jpegImageHash(r.bytes, after) : pngImageData(r.bytes, after);
+  const dataBefore = imageData[before.format](bytes, before);
+  const dataAfter = imageData[after.format](r.bytes, after);
   const [hb, ha, hIn, hOut] = await Promise.all([sha256Hex(dataBefore), sha256Hex(dataAfter), sha256Hex(bytes), sha256Hex(r.bytes)]);
   const allowed = new Set(['Orientation', 'JFIF header']);
   const leftovers = after.findings.filter((f) => f.severity !== 'info' && !allowed.has(f.label));
@@ -755,7 +914,7 @@ export async function strip(bytes, opts = {}) {
 }
 
 export function defaultFileName(name, format) {
-  const ext = format === 'jpeg' ? 'jpg' : 'png';
+  const ext = format === 'jpeg' ? 'jpg' : format === 'webp' ? 'webp' : 'png';
   const base = name.replace(/\.[A-Za-z0-9]+$/, '') || 'image';
   return `${base}.offframe.${ext}`;
 }
@@ -791,4 +950,4 @@ export function buildReceipt(fileName, result, options) {
       'This receipt lists labels and sizes only, never the removed values.',
     ],
   };
-}
+                            }
